@@ -11,9 +11,7 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-
-// ---- CORS for Flutter Web (Chrome / Edge) ----
-const cors = require('cors');
+// ---- CORS for Flutter Web (Chrome / Edge) and mobile ----
 app.use(cors({
   origin: '*',
   allowedHeaders: [
@@ -23,6 +21,23 @@ app.use(cors({
   ],
 }));
 
+// ---- Startup validation ----
+const required = [
+  'MPESA_CONSUMER_KEY',
+  'MPESA_CONSUMER_SECRET',
+  'MPESA_INITIATOR_NAME',
+  'MPESA_SECURITY_CREDENTIAL',
+  'MPESA_B2C_SHORTCODE',
+  'SUPABASE_URL',
+  'SUPABASE_ANON_KEY',
+  'SUPABASE_SERVICE_ROLE_KEY',
+  'PUBLIC_BASE_URL',
+];
+const missing = required.filter((k) => !process.env[k]);
+if (missing.length > 0) {
+  console.error('❌ Missing environment variables:', missing.join(', '));
+  process.exit(1);
+}
 
 // ---- Supabase clients ----
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -51,6 +66,7 @@ async function requireUser(req, res, next) {
       return res.status(401).json({ error: 'invalid_token' });
     }
     req.user = data.user;
+    req.jwt = jwt;
     next();
   } catch (e) {
     res.status(500).json({ error: 'auth_error', detail: String(e) });
@@ -71,9 +87,9 @@ app.post('/api/b2c/initiate', requireUser, async (req, res) => {
       return res.status(400).json({ error: 'invalid_phone' });
     }
 
-    // Load the payment (RLS applies because we use the anon client with user's JWT)
+    // Load the payment with the user's own JWT so RLS applies
     const userClient = createClient(supabaseUrl, process.env.SUPABASE_ANON_KEY, {
-      global: { headers: { Authorization: `Bearer ${req.headers.authorization.slice(7)}` } },
+      global: { headers: { Authorization: `Bearer ${req.jwt}` } },
     });
 
     const { data: payment, error: payErr } = await userClient
@@ -103,7 +119,9 @@ app.post('/api/b2c/initiate', requireUser, async (req, res) => {
     );
     const accessToken = authRes.data.access_token;
     if (!accessToken) {
-      return res.status(502).json({ error: 'daraja_auth_failed', detail: authRes.data });
+      return res
+        .status(502)
+        .json({ error: 'daraja_auth_failed', detail: authRes.data });
     }
 
     // ---- 2. Call B2C payment request ----
@@ -147,6 +165,10 @@ app.post('/api/b2c/initiate', requireUser, async (req, res) => {
         mpesa_result_desc: b2cData.ResponseDescription || null,
       })
       .eq('id', payment_id);
+
+    console.log(
+      `[B2C] payment=${payment_id.slice(0, 8)} phone=${phone} amount=${amount} → ${b2cData.ResponseCode}`,
+    );
 
     res.json(b2cData);
   } catch (e) {
@@ -195,7 +217,6 @@ app.post('/api/b2c/callback', async (req, res) => {
       update.payment_date = new Date().toISOString().slice(0, 10);
     }
 
-    // Match by conversation ID (Daraja usually sends this)
     if (conversationId) {
       await serviceClient
         .from('payments')
@@ -208,20 +229,41 @@ app.post('/api/b2c/callback', async (req, res) => {
         .eq('mpesa_originator_conversation_id', originatorId);
     }
 
+    console.log(
+      `[Callback] conversation=${conversationId?.slice(0, 20)} code=${resultCode} → ${newStatus}`,
+    );
+
     res.status(200).json({ ok: true });
   } catch (e) {
     console.error('Callback error:', e.message);
-    // Always 200 — Safaricom retries on non-2xx
     res.status(200).json({ ok: false });
   }
 });
 
+// =====================================================================
 // Health check
-app.get('/', (_req, res) => res.json({ ok: true, service: 'fieldlink-mpesa' }));
+// =====================================================================
+app.get('/', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'fieldlink-mpesa',
+    env: process.env.MPESA_ENV,
+    callback: `${process.env.PUBLIC_BASE_URL}/api/b2c/callback`,
+  });
+});
 
-// ---- Start ----
-const port = process.env.PORT || 3000;
+// =====================================================================
+// Start
+// =====================================================================
+const port = parseInt(process.env.PORT || '3000', 10);
 app.listen(port, () => {
-  console.log(`FieldLink-Mpesa listening on http://localhost:${port}`);
-  console.log(`Callback URL: ${process.env.PUBLIC_BASE_URL}/api/b2c/callback`);
+  console.log('');
+  console.log('========================================');
+  console.log('  FieldLink-Mpesa server running');
+  console.log('========================================');
+  console.log(`  Listening:  http://localhost:${port}`);
+  console.log(`  Env:        ${process.env.MPESA_ENV}`);
+  console.log(`  Callback:   ${process.env.PUBLIC_BASE_URL}/api/b2c/callback`);
+  console.log('========================================');
+  console.log('');
 });
